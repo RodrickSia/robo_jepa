@@ -50,7 +50,7 @@ import numpy as np
 import torch
 import torch.utils.data
 
-from app.robo_jepa.datasets.robot_video_dataset import RobotVideoDataset
+from app.robo_jepa.datasets.libero_dataset import LiberoDataset
 from src.datasets.utils.weighted_sampler import MemoryEfficientDistributedWeightedSampler
 
 _GLOBAL_SEED = 0
@@ -113,18 +113,123 @@ def init_datasets(
 ):
     """Build a multi-dataset data-loader with weighted distributed sampling.
 
-    Creates one :class:`RobotVideoDataset` per entry in *dataset_names*,
-    wraps them in a :class:`MultiDataset`, attaches a
-    :class:`MemoryEfficientDistributedWeightedSampler`, and returns the
-    resulting :class:`torch.utils.data.DataLoader`.
+    Creates one dataset per entry in ``dataset_names``: ``dataset_type``
+    in ``dataset_kwargs[name]`` selects ``'robot_video'`` (default) or
+    ``'libero'``. Wraps the datasets in :class:`MultiDataset` and attaches
+    :class:`MemoryEfficientDistributedWeightedSampler`.
 
-    Per-dataset ``s3_prefix`` values are **joined** with the common one::
+    Configuration format
+    --------------------
+    ``data_paths``, ``dataset_names``, and ``dataset_weights`` are nonempty
+    lists of equal length, with corresponding entries at each index.
+    Every name must have an entry in ``dataset_kwargs``. Per-dataset options
+    override ``common_kwargs``; the merged options must be accepted by the
+    selected dataset constructor. ``dataset_type`` is a factory option and
+    belongs in ``dataset_kwargs[name]``, not ``common_kwargs``.
+
+    RobotVideoDataset storage (local filesystem or S3)
+    ------------------------------------------------
+    Pass ``None`` as its ``data_paths`` entry. Both common and per-dataset
+    ``s3_prefix`` keys are required, even for local storage; they are joined::
 
         effective_s3_prefix = os.path.join(common_kwargs['s3_prefix'],
                                            dataset_kwargs[name]['s3_prefix'])
 
+    The resulting root contains::
+
+        dataset_index.csv              # "path" column: episode directories
+        aggregated_metadata.json       # when required by metadata filters
+        <episode>/data.h5
+        <episode>/<camera>/video.mp4
+
+    Each ``data.h5`` contains this default Cartesian layout::
+
+        cameras/<camera_name>          # string: relative MP4 filename
+        trajectory/observation/robot_state/
+            cartesian_position         # [N, pose_dim], typically xyz + Euler XYZ
+            gripper_position           # [N, gripper_dim]
+        trajectory/action/<field>      # needed for action_source='action_key'
+
+    ``action_source='state_delta'`` derives actions from consecutive states.
+    ``action_source='action_key'`` reads recorded commands using the configured
+    ``action_key_layout``, chunks them over each sampled interval, and supplies
+    zero proprioceptive states. Other state layouts are configured through
+    RobotVideoDataset options such as ``state_keys`` or ``use_joint_state``.
+
+    Native LIBERO storage
+    ---------------------
+    Set ``dataset_type='libero'``. Its ``data_paths`` entry is a local HDF5
+    filename or a list of filenames, not an episode directory or CSV. Each
+    file contains::
+
+        data/demo_<id>/
+            actions                    # [N, 7], native controller commands
+            obs/
+                agentview_rgb          # uint8 [N, H, W, 3]
+                eye_in_hand_rgb         # uint8 [N, H, W, 3]
+                ee_pos                 # [N, 3]
+                ee_ori                 # [N, 3], axis-angle rotation vector
+                gripper_states         # [N, 2], finger joint positions
+
+    All fields in a demonstration must have the same N. ``cameras`` selects
+    image dataset names under ``obs``; only selected cameras are required.
+    ``view_map`` must map each selected name to a semantic camera ID understood
+    by the model. ``demos`` optionally selects demonstration names in each file.
+    Only complete, contiguous clips are indexed; short demonstrations are
+    skipped with a warning. ``fps``, if supplied, must equal ``raw_fps``.
+    No state/action convention conversion is performed: states concatenate
+    ``ee_pos``, ``ee_ori``, and ``gripper_states`` into 8 values, and recorded
+    7-D actions are retained. Both are zero-padded to ``pad_size >= 8``.
+
+    Example LIBERO loader configuration::
+
+        loader, sampler = init_datasets(
+            data_paths=[['/data/task_a.hdf5', '/data/task_b.hdf5']],
+            dataset_names=['Libero'],
+            dataset_weights=[1.0],
+            common_kwargs={'frames_per_clip': 16, 'pad_size': 64},
+            dataset_kwargs={'Libero': {
+                'dataset_type': 'libero',
+                'embodiment_name': 'libero',
+                'cameras': ['eye_in_hand_rgb'],
+                'view_map': {'eye_in_hand_rgb': 2},
+                'raw_fps': 20,
+            }},
+            batch_size=4,
+        )
+
+    The model must separately register ``embodiment_name`` with compatible
+    learned projections; the loader does not add or adapt model parameters.
+    Do not include S3-only options in LIBERO's merged constructor options.
+
+    Training batch format
+    ---------------------
+    With default collation and ordinary predictor clips, batches contain::
+
+        (video, raw_video, actions, states, extrinsics, padding_mask,
+         view_ids, dt, start_frame, trajectory_name, embodiment_name, index)
+
+        video          [B, 3, V, T, H, W]  normalized encoder input
+        raw_video      [B, T, V, H, W, 3]  unnormalized RGB, 0-255 float
+        actions        [B, T, P]          padded action vectors
+        states         [B, T, P]          padded proprioceptive states
+        extrinsics     [B, T, V, 6]       NaN when unavailable
+        padding_mask   [B, T]             1=valid, 0=padding
+        view_ids       [B, V]             integer camera IDs
+        dt             [B, T]             seconds per sampled interval
+        start_frame    [B]                clip start indices
+        trajectory_name, embodiment_name  sequences of B strings
+        index          [B]                per-dataset sample indices
+
+    B is batch size, V views, T clip length, and P ``pad_size``. Numeric
+    video/action/state tensors are float32 before training-device conversion.
+    Spatial sizes follow the transform; ``resize`` can give normalized and
+    raw video different sizes. RobotVideoDataset's intermediate-frame decoder
+    mode has different video time lengths; see its class documentation.
+
     Args:
-        data_paths (list): One entry per dataset (legacy, pass None for each).
+        data_paths (list): One entry per dataset. For LIBERO, each entry is
+            an HDF5 filename or list of filenames; for legacy datasets, use None.
         dataset_names (list[str]): Dataset identifiers matching keys in
             *dataset_kwargs*.
         dataset_weights (list[float]): Sampling weights (unnormalised).
@@ -132,30 +237,50 @@ def init_datasets(
             (e.g. ``s3_profile``, ``pad_size``, ``frames_per_clip``).
         dataset_kwargs (dict[str, dict]): Per-dataset keyword arguments
             keyed by dataset name. Overrides/extends *common_kwargs*.
+            Set ``dataset_type='libero'`` for native LIBERO HDF5 clips.
+            LIBERO requires ``embodiment_name`` and ``view_map`` and accepts
+            ``frames_per_clip``, ``pad_size``, ``cameras``, ``raw_fps``, and
+            ``demos``. No S3 options are needed for a LIBERO-only loader.
         rank (int): Current process rank for distributed training.
         world_size (int): Total number of processes.
         batch_size (int): Batch size per rank.
         collator (callable, optional): Custom collate function.
         transform (callable, optional): Video transform passed to every
-            dataset (see :func:`transforms.make_transforms`).
+            dataset (see :func:`transforms.make_transforms`). Maps
+            ``[T, H, W, 3]`` arrays to normalized and raw ``[3, T, H, W]``
+            tensors. LIBERO uses ``make_transforms()`` when omitted.
         drop_last (bool): Drop the last incomplete batch.
         num_workers (int): DataLoader worker processes.
         pin_mem (bool): Pin memory for GPU transfer.
         shuffle (bool): Enable random sampling.
         persistent_workers (bool): Keep workers alive between epochs.
+        num_replicas_override (int, optional): Override sampler world size
+            for a data-parallel/view group.
+        rank_override (int, optional): Override sampler rank within that group.
 
     Returns:
         tuple: ``(data_loader, dist_sampler)``.
     """
+    if not dataset_names or not (len(data_paths) == len(dataset_names) == len(dataset_weights)):
+        raise ValueError("data_paths, dataset_names, and dataset_weights must have the same nonzero length")
     datasets = []
     for data_path, dataset_name in zip(data_paths, dataset_names):
         current_kwargs = copy(common_kwargs)
         new_kwargs = copy(dataset_kwargs[dataset_name])
-        print("current_kwargs s3 prefix:", current_kwargs.get("s3_prefix"))
-        print("new_kwargs s3 prefix:", new_kwargs.get("s3_prefix"))
-        new_kwargs["s3_prefix"] = os.path.join(current_kwargs["s3_prefix"], new_kwargs["s3_prefix"])
+        dataset_type = new_kwargs.pop("dataset_type", "robot_video")
+        if dataset_type == "robot_video":
+            from app.robo_jepa.datasets.robot_video_dataset import RobotVideoDataset
+
+            print("current_kwargs s3 prefix:", current_kwargs.get("s3_prefix"))
+            print("new_kwargs s3 prefix:", new_kwargs.get("s3_prefix"))
+            new_kwargs["s3_prefix"] = os.path.join(current_kwargs["s3_prefix"], new_kwargs["s3_prefix"])
+            dataset_class = RobotVideoDataset
+        elif dataset_type == "libero":
+            dataset_class = LiberoDataset
+        else:
+            raise ValueError(f"Unknown dataset_type: {dataset_type}")
         current_kwargs.update(new_kwargs)
-        dataset = RobotVideoDataset(
+        dataset = dataset_class(
             dataset_name=dataset_name,
             data_path=data_path,
             transform=transform,

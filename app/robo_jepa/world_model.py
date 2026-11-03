@@ -809,7 +809,7 @@ class WorldModel(TrainableModel):
         batch=100,
         device="cuda",
         pos_embedding_resize_t=None,
-    ) -> WorldModelState:
+    ) -> tuple[torch.Tensor, WorldModelState]:
         """
         the main forward pass function for working with the world model.
         This method runs the world model in an RNN style:
@@ -854,10 +854,7 @@ class WorldModel(TrainableModel):
         See :mod:`app.robo_jepa.embodiment_preprocessing` for details.
 
         Returns:
-            new_state:
-            new_history: a tuple of
-                * actions_history ([B, T, action_dim]):
-                * video_features_history ([B, T+1, V, H, W, C]):
+            A tuple of predicted visual features and the updated WorldModelState.
         """
         actions_history, video_features_history = state.actions, state.features
         B, T, V, H, W, C = video_features_history.shape
